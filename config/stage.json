@@ -1,0 +1,5 @@
+{
+    "api_endpoints": [
+        "http://172.17.0.1:8001/sensormetrics"
+    ]
+}

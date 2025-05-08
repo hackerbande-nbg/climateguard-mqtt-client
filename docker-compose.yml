@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  mqtt-client:
+    container_name: quantum_mqtt_${ENV}
+    build: .
+    ports:
+      - ${MQTT_PORT}:8883
+    volumes:
+      - data:/app/data
+    environment:
+      - MQTT_BROKER=eu1.cloud.thethings.network
+      - MQTT_PORT=8883
+      - MQTT_TOPIC=v3/climateguard@ttn/devices/+/up
+      - MQTT_USERNAME=climateguard@ttn
+      - TTN_API_KEY=${TTN_API_KEY}
+    command: ["python", "app/main.py"]
+    restart: unless-stopped
+volumes:
+  data:
