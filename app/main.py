@@ -18,7 +18,7 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "v3/climateguard@ttn/devices/+/up")
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "climateguard@ttn")
 API_ENDPOINT = os.getenv(
-    "API_ENDPOINT", "http://localhost:8001/sensormetrics")
+    "API_ENDPOINT", "http://localhost:8001/v2/metrics")
 
 
 class MQTTClient:
@@ -79,7 +79,7 @@ def send_data_to_api(device_id, temperature, humidity):
     data = {
         "timestamp_device": int(datetime.now().timestamp()),
         "timestamp_server": int(datetime.now().timestamp()),
-        "device_id": device_id,
+        "device_name": device_id,
         "temperature": temperature,
         "humidity": humidity,
     }
