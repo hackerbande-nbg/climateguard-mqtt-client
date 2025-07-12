@@ -14,12 +14,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Write .env file
+        run: echo "${{ secrets.QUANTUM_MQTT_ENV_PROD }}" > .env
+
       - name: Run Docker container
-        env:
-          TTN_API_KEY: ${{ secrets.TTN_API_KEY }}
         run: |
-          if [ -z "${TTN_API_KEY}" ]; then
-            echo "TTN_API_KEY secret is not set. Please add it in your repository settings."
-            exit 1
-          fi
           docker compose -p mqtt up -d --build --force-recreate
