@@ -19,4 +19,5 @@ jobs:
 
       - name: Run Docker container
         run: |
+          docker compose -p mqtt down
           docker compose -p mqtt up -d --build --force-recreate
