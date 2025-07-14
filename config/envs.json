@@ -1,0 +1,8 @@
+{
+    "prod": [
+        "https://api.quantum.hackerban.de/v2/metrics"
+    ],
+    "dev": [
+        "https://api-stage.quantum.hackerban.de/v2/metrics"
+    ]
+}
