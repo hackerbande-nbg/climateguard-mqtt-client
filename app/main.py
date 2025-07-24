@@ -144,9 +144,9 @@ def persist_raw_data(device_id, data, target_dir="data"):
         raise e
 
 
-def send_data_to_api(device_id, temperature, humidity):
+def send_data_to_api(device_id, temperature, humidity, pressure):
     logger.info(
-        f"Sending data to API for device {device_id}: Temperature={temperature}°C, Humidity={humidity}%")
+        f"Sending data to API for device {device_id}: Temperature={temperature}°C, Humidity={humidity}%, Pressure={pressure} hPa")
 
     # Get API key from environment variables
     api_key = os.getenv("QUANTUM_API_KEY")
@@ -163,6 +163,7 @@ def send_data_to_api(device_id, temperature, humidity):
         "device_name": device_id,
         "temperature": temperature,
         "humidity": humidity,
+        "air_pressure": pressure
     }
 
     logger.debug(f"API request payload: {data}")
@@ -231,7 +232,7 @@ def process_message(payload, data_dir="data"):
         temperature, humidity, pressure = decode_payload(frm_payload)
 
         # Send processed data to API
-        send_data_to_api(device_id, temperature, humidity)
+        send_data_to_api(device_id, temperature, humidity, pressure)
 
         logger.info(
             f"Message from device {device_id} successfully processed and saved.")
