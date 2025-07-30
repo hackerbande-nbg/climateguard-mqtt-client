@@ -115,16 +115,28 @@ def decode_payload(payload):
     decoded = base64.b64decode(payload)
     logger.debug(f"Base64 decoded bytes: {decoded.hex()}")
     try:
-        temperature = int.from_bytes(
-            decoded[0:2], byteorder="big", signed=True) / 100
-        humidity = int.from_bytes(decoded[2:4], byteorder="big") / 100
-        pressure = int.from_bytes(decoded[4:7], byteorder="big") / 100
+        version = decoded[0]
+        logger.info(f"Payload version: {version}")
+        # Load payload layout config
+        config_path = os.path.join(os.path.dirname(__file__), "..", "config", "payload_layout.json")
+        with open(config_path, 'r') as f:
+            layout = json.load(f)
+        if str(version) != layout.get("version", "1"):
+            logger.warning(f"Payload version {version} does not match config version {layout.get('version')}")
+        # Helper to extract bytes and convert
+        def extract_value(indices, signed=False):
+            b = bytes([decoded[i] for i in indices])
+            return int.from_bytes(b, byteorder="big", signed=signed) / 100
+        temperature = extract_value(layout["temperature"], signed=True)
+        humidity = extract_value(layout["humidity"])
+        pressure = extract_value(layout["pressure"])
+        battery_voltage = extract_value(layout["voltage"])
         logger.info(
-            f"Decoded sensor data - Temperature: {temperature}°C, Humidity: {humidity}%, Pressure: {pressure} hPa")
+            f"Decoded sensor data - Temperature: {temperature}°C, Humidity: {humidity}%, Pressure: {pressure} hPa, Battery Voltage: {battery_voltage}V")
     except Exception as e:
         logger.error(f"Error decoding payload: {e}")
         raise e
-    return temperature, humidity, pressure
+    return temperature, humidity, pressure, battery_voltage
 
 
 def persist_raw_data(device_id, data, target_dir="data"):
@@ -144,9 +156,9 @@ def persist_raw_data(device_id, data, target_dir="data"):
         raise e
 
 
-def send_data_to_api(device_id, temperature, humidity, pressure):
+def send_data_to_api(device_id, temperature, humidity, pressure, battery_voltage):
     logger.info(
-        f"Sending data to API for device {device_id}: Temperature={temperature}°C, Humidity={humidity}%, Pressure={pressure} hPa")
+        f"Sending data to API for device {device_id}: Temperature={temperature}°C, Humidity={humidity}%, Pressure={pressure} hPa, Battery Voltage={battery_voltage}V")
 
     # Get API key from environment variables
     api_key = os.getenv("QUANTUM_API_KEY")
@@ -163,7 +175,8 @@ def send_data_to_api(device_id, temperature, humidity, pressure):
         "device_name": device_id,
         "temperature": temperature,
         "humidity": humidity,
-        "air_pressure": pressure
+        "air_pressure": pressure,
+        "battery_voltage": battery_voltage
     }
 
     logger.debug(f"API request payload: {data}")
@@ -229,10 +242,10 @@ def process_message(payload, data_dir="data"):
         persist_raw_data(device_id, payload, data_dir)
 
         # Decode the sensor data
-        temperature, humidity, pressure = decode_payload(frm_payload)
+        temperature, humidity, pressure, battery_voltage = decode_payload(frm_payload)
 
         # Send processed data to API
-        send_data_to_api(device_id, temperature, humidity, pressure)
+        send_data_to_api(device_id, temperature, humidity, pressure, battery_voltage)
 
         logger.info(
             f"Message from device {device_id} successfully processed and saved.")

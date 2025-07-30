@@ -9,9 +9,9 @@ from app.main import process_message
 
 test_data_dir = "data/test"
 
-TEST_PAYLOAD = {
+TEST_PAYLOAD_V1 = {
     "uplink_message": {
-        "frm_payload": "Bi8OnAF6ATc=",  # Encoded payload
+        "frm_payload": "AQb+GaYBf1wBkw==",  # Encoded payload
         "rx_metadata": [{"gateway_ids": {"gateway_id": "test-gateway"}}],
     },
     "end_device_ids": {"device_id": "test-sensor"},
@@ -39,7 +39,7 @@ def test_process_message():
 
     # Call the function with the test payload
     data_dir = os.path.join(test_data_dir, generate_random_string())
-    result = process_message(TEST_PAYLOAD, data_dir)
+    result = process_message(TEST_PAYLOAD_V1, data_dir)
     assert result == 0, "Test failed: process_message returned an error."
 
     # Verify that the data was saved in the correct folder
