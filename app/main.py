@@ -144,7 +144,9 @@ def persist_raw_data(device_id, data, target_dir="data"):
         raise e
 
 
-def send_data_to_api(device_id, temperature, humidity):
+def send_data_to_api(device_id, temperature, humidity, air_pressure=None,
+                     battery_voltage=None, confirmed=None, consumed_airtime=None,
+                     f_cnt=None, frequency=None, rx_metadata=None, settings=None):
     logger.info(
         f"Sending data to API for device {device_id}: Temperature={temperature}°C, Humidity={humidity}%")
 
@@ -157,6 +159,7 @@ def send_data_to_api(device_id, temperature, humidity):
     logger.debug(
         f"Using API key: {api_key[:8]}..." if api_key else "No API key found")
 
+    # Build base metric data
     data = {
         "timestamp_device": int(datetime.now().timestamp()),
         "timestamp_server": int(datetime.now().timestamp()),
@@ -164,6 +167,70 @@ def send_data_to_api(device_id, temperature, humidity):
         "temperature": temperature,
         "humidity": humidity,
     }
+
+    # Add optional fields
+    if air_pressure is not None:
+        data["air_pressure"] = air_pressure
+    if battery_voltage is not None:
+        data["battery_voltage"] = battery_voltage
+    if confirmed is not None:
+        data["confirmed"] = confirmed
+    if consumed_airtime is not None:
+        data["consumed_airtime"] = consumed_airtime
+    if f_cnt is not None:
+        data["f_cnt"] = f_cnt
+    if frequency is not None:
+        data["frequency"] = frequency
+
+    # Build sensor_messages from rx_metadata
+    if rx_metadata and len(rx_metadata) > 0:
+        sensor_messages = []
+
+        # Extract LoRa settings from uplink settings (shared across all gateways)
+        lora_bandwidth = None
+        lora_spreading_factor = None
+        lora_coding_rate = None
+
+        if settings:
+            data_rate = settings.get("data_rate", {})
+            lora = data_rate.get("lora", {})
+            lora_bandwidth = lora.get("bandwidth")
+            lora_spreading_factor = lora.get("spreading_factor")
+            lora_coding_rate = lora.get("coding_rate")
+            logger.debug(
+                f"LoRa settings - bandwidth={lora_bandwidth}, SF={lora_spreading_factor}, coding_rate={lora_coding_rate}")
+
+        for metadata in rx_metadata:
+            sensor_message = {}
+
+            # Extract gateway ID
+            gateway_ids = metadata.get("gateway_ids", {})
+            gateway_id = gateway_ids.get("gateway_id")
+            if gateway_id:
+                sensor_message["gateway_id"] = gateway_id
+
+            # Extract signal quality metrics
+            if "rssi" in metadata:
+                sensor_message["rssi"] = metadata["rssi"]
+            if "snr" in metadata:
+                sensor_message["snr"] = metadata["snr"]
+            if "channel_rssi" in metadata:
+                sensor_message["channel_rssi"] = metadata["channel_rssi"]
+
+            # Add LoRa settings (same for all gateways in this message)
+            if lora_bandwidth is not None:
+                sensor_message["lora_bandwidth"] = lora_bandwidth
+            if lora_spreading_factor is not None:
+                sensor_message["lora_spreading_factor"] = lora_spreading_factor
+            if lora_coding_rate is not None:
+                sensor_message["lora_coding_rate"] = lora_coding_rate
+
+            sensor_messages.append(sensor_message)
+
+        if sensor_messages:
+            data["sensor_messages"] = sensor_messages
+            logger.debug(
+                f"Added {len(sensor_messages)} sensor messages from rx_metadata")
 
     logger.debug(f"API request payload: {data}")
 
@@ -230,8 +297,47 @@ def process_message(payload, data_dir="data"):
         # Decode the sensor data
         temperature, humidity, pressure = decode_payload(frm_payload)
 
-        # Send processed data to API
-        send_data_to_api(device_id, temperature, humidity)
+        # Extract additional fields from uplink_message
+        decoded_payload = uplink_message.get("decoded_payload", {})
+        battery_voltage = decoded_payload.get("voltage")
+
+        # Extract LoRaWAN metadata
+        confirmed = uplink_message.get("confirmed")
+        consumed_airtime = uplink_message.get("consumed_airtime")
+        f_cnt = uplink_message.get("f_cnt")
+
+        # Extract frequency from settings
+        settings = uplink_message.get("settings", {})
+        frequency = settings.get("frequency")
+
+        # Convert consumed_airtime from string (e.g., "1.482752s") to float
+        if consumed_airtime and isinstance(consumed_airtime, str):
+            try:
+                # Remove the 's' suffix and convert to float
+                consumed_airtime = float(consumed_airtime.rstrip('s'))
+                logger.debug(f"Parsed consumed_airtime: {consumed_airtime}s")
+            except ValueError as e:
+                logger.warning(
+                    f"Failed to parse consumed_airtime '{consumed_airtime}': {e}")
+                consumed_airtime = None
+
+        logger.debug(
+            f"Additional metadata - confirmed={confirmed}, f_cnt={f_cnt}, frequency={frequency}, consumed_airtime={consumed_airtime}")
+
+        # Send processed data to API with all metadata
+        send_data_to_api(
+            device_id=device_id,
+            temperature=temperature,
+            humidity=humidity,
+            air_pressure=pressure,
+            battery_voltage=battery_voltage,
+            confirmed=confirmed,
+            consumed_airtime=consumed_airtime,
+            f_cnt=f_cnt,
+            frequency=frequency,
+            rx_metadata=rx_metadata,
+            settings=settings
+        )
 
         logger.info(
             f"Message from device {device_id} successfully processed and saved.")
