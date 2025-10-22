@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ClimatGuard MQTT Client
 
 MQTT client service for ClimateGuard monitoring system.
@@ -66,3 +67,14 @@ docker compose -p mqtt logs --tail=100
 The production environment variables are stored in GitHub Secrets as `QUANTUM_MQTT_ENV_PROD` and are automatically deployed during the GitHub Actions workflow.
 
 For local development, create a `.env` file in the project root with the necessary configuration.
+=======
+# quantum-mqtt-client
+quantum telemetry mqtt client pulling data from TTN
+
+# Payload Layout and Versioning Concept
+
+The first payload byte uniquely identifies the payload format version. This approach allows for flexible evolution of the payload structure while maintaining backward compatibility and clear parsing rules for consumers.
+
+[View the JSON payload layout mapping for v1](./config/payload_layout.json)
+
+>>>>>>> 882dbba92e7e0463529825f75eb27b2cf8b5b021

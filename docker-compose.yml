@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   mqtt-client:
     container_name: quantum_mqtt_${ENV}
