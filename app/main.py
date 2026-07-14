@@ -1,436 +1,299 @@
-import json
+"""ClimateGuard MQTT ingestion for TTN and Mannheim weather stations.
+
+Incoming messages are normalized before delivery.  Delivery is deliberately
+disabled unless QUANTUM_WRITE_ENABLED=true is set by an operator.
+"""
+
 import base64
+import json
 import os
-import random
-import string
-from loguru import logger
-from dotenv import load_dotenv
-from datetime import datetime
-import requests
+import signal
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional
+
 import paho.mqtt.client as mqtt
-
-# Load environment variables from .env file
-load_dotenv()
-logger.info("Environment variables loaded from .env file")
-
-# MQTT connection parameters
-MQTT_BROKER = os.getenv("MQTT_BROKER", "eu1.cloud.thethings.network")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "v3/climateguard@ttn/devices/+/up")
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "climateguard@ttn")
-
-# Load API endpoints from envs.json based on environment
+import requests
+from dotenv import load_dotenv
+from loguru import logger
 
 
-def load_api_endpoints():
-    env = os.getenv("ENV")
-    if not env:
-        logger.error("ENV environment variable is not set!")
-        raise ValueError("ENV environment variable is required")
+MANNHEIM_TOPIC_DEVICES = {
+    "climateguard/M1": "M1",
+    "climateguard/Lufft": "Lufft",
+}
 
-    config_path = os.path.join(os.path.dirname(
-        __file__), "..", "config", "envs.json")
 
+@dataclass(frozen=True)
+class SourceConfig:
+    name: str
+    broker: str
+    port: int
+    username: str
+    password: str
+    topic: str
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    sources: tuple[SourceConfig, ...]
+    endpoint: str
+    quantum_api_key: Optional[str]
+    write_enabled: bool
+
+
+@dataclass(frozen=True)
+class Metric:
+    device_name: str
+    timestamp_device: int
+    temperature: float
+    humidity: float
+    air_pressure: Optional[float] = None
+    battery_voltage: Optional[float] = None
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_api_payload(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "timestamp_device": self.timestamp_device,
+            "timestamp_server": int(datetime.now(timezone.utc).timestamp()),
+            "device_name": self.device_name,
+            "temperature": self.temperature,
+            "humidity": self.humidity,
+        }
+        if self.air_pressure is not None:
+            data["air_pressure"] = self.air_pressure
+        if self.battery_voltage is not None:
+            data["battery_voltage"] = self.battery_voltage
+        data.update(self.extra)
+        return data
+
+
+def _required(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"{name} must be set")
+    return value
+
+
+def _port(name: str, default: int) -> int:
     try:
-        with open(config_path, 'r') as f:
-            envs_config = json.load(f)
-
-        endpoints = envs_config.get(env, [])
-        if not endpoints:
-            logger.error(
-                f"No endpoints found for environment '{env}' in config file")
-            raise ValueError(
-                f"No endpoints configured for environment '{env}'")
-
-        logger.info(
-            f"Loaded {len(endpoints)} API endpoints for environment '{env}'")
-        return endpoints
-    except FileNotFoundError:
-        logger.error(f"Config file not found: {config_path}")
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-    except json.JSONDecodeError as e:
-        logger.error(f"Error parsing config file: {e}")
-        raise ValueError(f"Invalid JSON in config file: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error loading config: {e}")
-        raise
-
-
-try:
-    API_ENDPOINTS = load_api_endpoints()
-except Exception as e:
-    logger.error(f"Failed to load API endpoints: {e}")
-    logger.error(
-        "Application cannot start without proper endpoint configuration")
-    exit(1)
-
-# Log configuration
-logger.info(
-    f"MQTT Configuration - Broker: {MQTT_BROKER}, Port: {MQTT_PORT}, Topic: {MQTT_TOPIC}, Username: {MQTT_USERNAME}")
-logger.info(f"API Endpoints: {API_ENDPOINTS}")
-logger.info(f"Environment: {os.getenv('ENV', 'not set')}")
-
-
-class MQTTClient:
-    def __init__(self, broker, port, username, password, topic, on_message_callback):
-        self.broker = broker
-        self.port = port
-        self.username = username
-        self.password = password
-        self.topic = topic
-        self.on_message_callback = on_message_callback
-        self.client = mqtt.Client()
-
-    def connect(self):
-        logger.info(
-            f"Attempting to connect to MQTT broker {self.broker}:{self.port}")
-        self.client.username_pw_set(self.username, self.password)
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message_callback
-        self.client.tls_set()  # Use default certificate settings
-        logger.info("TLS enabled for MQTT connection")
-        try:
-            self.client.connect(self.broker, self.port, 60)
-            logger.info("MQTT connection initiated")
-        except Exception as e:
-            logger.error(f"Failed to initiate MQTT connection: {e}")
-            raise e
-
-    def on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            logger.info("Connected to the MQTT Broker")
-            logger.info(f"Subscribing to topic: {self.topic}")
-            client.subscribe(self.topic)
-            logger.info("Successfully subscribed to MQTT topic")
-        else:
-            logger.error(f"Connection failed with error code {rc}")
-
-    def loop_forever(self):
-        logger.info("Starting MQTT client loop...")
-        self.client.loop_forever()
-
-
-def decode_payload(payload):
-    logger.debug(f"Decoding payload: {payload}")
-    decoded = base64.b64decode(payload)
-    logger.debug(f"Base64 decoded bytes: {decoded.hex()}")
-    try:
-        version = decoded[0]
-        logger.info(f"Payload version: {version}")
-        # Load payload layout config
-        config_path = os.path.join(os.path.dirname(
-            __file__), "..", "config", "payload_layout.json")
-        with open(config_path, 'r') as f:
-            layout = json.load(f)
-        if str(version) != layout.get("version", "1"):
-            logger.warning(
-                f"Payload version {version} does not match config version {layout.get('version')}")
-        # Helper to extract bytes and convert
-
-        def extract_value(indices, signed=False):
-            b = bytes([decoded[i] for i in indices])
-            return int.from_bytes(b, byteorder="big", signed=signed) / 100
-        temperature = extract_value(layout["temperature"], signed=True)
-        humidity = extract_value(layout["humidity"])
-        pressure = extract_value(layout["pressure"])
-        battery_voltage = extract_value(layout["voltage"])
-        logger.info(
-            f"Decoded sensor data - Temperature: {temperature}°C, Humidity: {humidity}%, Pressure: {pressure} hPa, Battery Voltage: {battery_voltage}V")
-    except Exception as e:
-        logger.error(f"Error decoding payload: {e}")
-        raise e
-    return temperature, humidity, pressure, battery_voltage
-
-
-def persist_raw_data(device_id, data, target_dir="data"):
-    try:
-        logger.debug(
-            f"Persisting raw data for device {device_id} to directory {target_dir}")
-        os.makedirs(target_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(target_dir, f"{device_id}_{timestamp}.json")
-
-        with open(filename, "w") as file:
-            json.dump(data, file, indent=2)
-
-        logger.info(f"Raw data saved to {filename}")
-    except Exception as e:
-        logger.error(f"Error saving data to file: {e}")
-        raise e
-
-
-def send_data_to_api(device_id, temperature, humidity, air_pressure=None,
-                     battery_voltage=None, confirmed=None, consumed_airtime=None,
-                     f_cnt=None, frequency=None, rx_metadata=None, settings=None):
-    logger.info(
-        f"Sending data to API for device {device_id}: Temperature={temperature}°C, Humidity={humidity}%, Pressure={air_pressure} hPa, Battery Voltage={battery_voltage}V")
-
-    # Get API key from environment variables
-    api_key = os.getenv("QUANTUM_API_KEY")
-    if not api_key:
-        logger.error("Error: QUANTUM_API_KEY is not set!")
-        return
-
-    logger.debug(
-        f"Using API key: {api_key[:8]}..." if api_key else "No API key found")
-
-    # Build base metric data
-    data = {
-        "timestamp_device": int(datetime.now().timestamp()),
-        "timestamp_server": int(datetime.now().timestamp()),
-        "device_name": device_id,
-        "temperature": temperature,
-        "humidity": humidity,
-    }
-
-    # Add optional fields
-    if air_pressure is not None:
-        data["air_pressure"] = air_pressure
-    if battery_voltage is not None:
-        data["battery_voltage"] = battery_voltage
-    if confirmed is not None:
-        data["confirmed"] = confirmed
-    if consumed_airtime is not None:
-        data["consumed_airtime"] = consumed_airtime
-    if f_cnt is not None:
-        data["f_cnt"] = f_cnt
-    if frequency is not None:
-        data["frequency"] = frequency
-
-    # Build sensor_messages from rx_metadata
-    if rx_metadata and len(rx_metadata) > 0:
-        sensor_messages = []
-
-        # Extract LoRa settings from uplink settings (shared across all gateways)
-        lora_bandwidth = None
-        lora_spreading_factor = None
-        lora_coding_rate = None
-
-        if settings:
-            data_rate = settings.get("data_rate", {})
-            lora = data_rate.get("lora", {})
-            lora_bandwidth = lora.get("bandwidth")
-            lora_spreading_factor = lora.get("spreading_factor")
-            lora_coding_rate = lora.get("coding_rate")
-            logger.debug(
-                f"LoRa settings - bandwidth={lora_bandwidth}, SF={lora_spreading_factor}, coding_rate={lora_coding_rate}")
-
-        for metadata in rx_metadata:
-            sensor_message = {}
-
-            # Extract gateway ID
-            gateway_ids = metadata.get("gateway_ids", {})
-            gateway_id = gateway_ids.get("gateway_id")
-            if gateway_id:
-                sensor_message["gateway_id"] = gateway_id
-
-            # Extract signal quality metrics
-            if "rssi" in metadata:
-                sensor_message["rssi"] = metadata["rssi"]
-            if "snr" in metadata:
-                sensor_message["snr"] = metadata["snr"]
-            if "channel_rssi" in metadata:
-                sensor_message["channel_rssi"] = metadata["channel_rssi"]
-
-            # Add LoRa settings (same for all gateways in this message)
-            if lora_bandwidth is not None:
-                sensor_message["lora_bandwidth"] = lora_bandwidth
-            if lora_spreading_factor is not None:
-                sensor_message["lora_spreading_factor"] = lora_spreading_factor
-            if lora_coding_rate is not None:
-                sensor_message["lora_coding_rate"] = lora_coding_rate
-
-            sensor_messages.append(sensor_message)
-
-        if sensor_messages:
-            data["sensor_messages"] = sensor_messages
-            logger.debug(
-                f"Added {len(sensor_messages)} sensor messages from rx_metadata")
-
-    logger.debug(f"API request payload: {data}")
-
-    # Add API key to headers as required by the API
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-Key": api_key
-    }
-
-    # Send to all configured endpoints
-    success_count = 0
-    total_endpoints = len(API_ENDPOINTS)
-
-    for i, endpoint in enumerate(API_ENDPOINTS):
-        logger.debug(
-            f"Making POST request to endpoint {i+1}/{total_endpoints}: {endpoint}")
-
-        try:
-            response = requests.post(
-                endpoint, json=data, headers=headers, timeout=10)
-            logger.info(
-                f"API response from {endpoint}: status {response.status_code}")
-
-            if response.status_code == 200:
-                logger.info(
-                    f"Data successfully sent to {endpoint}: {response.json()}")
-                success_count += 1
-            else:
-                logger.error(
-                    f"Failed to send data to {endpoint}: {response.status_code} - {response.text}")
-        except requests.exceptions.RequestException as e:
-            logger.error(
-                f"Network error while sending data to {endpoint}: {e}")
-        except Exception as e:
-            logger.error(
-                f"Unexpected error while sending data to {endpoint}: {e}")
-
-    logger.info(
-        f"Successfully sent data to {success_count}/{total_endpoints} endpoints")
-    return success_count
-
-
-def process_message(payload, data_dir="data"):
-    logger.info("Processing incoming MQTT message")
-    try:
-        uplink_message = payload.get("uplink_message", {})
-        frm_payload = uplink_message.get("frm_payload", "")
-        rx_metadata = uplink_message.get("rx_metadata", [])
-        end_sensor_ids = payload.get("end_device_ids", {})
-        device_id = end_sensor_ids.get("device_id", "unknown_device")
-
-        logger.info(f"Processing message from device: {device_id}")
-        logger.debug(f"Received {len(rx_metadata)} metadata entries")
-
-        if not frm_payload:
-            logger.error("Error: 'frm_payload' is missing from the message!")
-            return
-
-        logger.debug(f"Frame payload received: {frm_payload}")
-
-        # Persist raw data first
-        persist_raw_data(device_id, payload, data_dir)
-
-        # Decode the sensor data - now returns 4 values including battery_voltage
-        temperature, humidity, pressure, battery_voltage = decode_payload(
-            frm_payload)
-
-        # Extract LoRaWAN metadata
-        confirmed = uplink_message.get("confirmed")
-        consumed_airtime = uplink_message.get("consumed_airtime")
-        f_cnt = uplink_message.get("f_cnt")
-
-        # Extract frequency from settings
-        settings = uplink_message.get("settings", {})
-        frequency = settings.get("frequency")
-
-        # Convert consumed_airtime from string (e.g., "1.482752s") to float
-        if consumed_airtime and isinstance(consumed_airtime, str):
-            try:
-                # Remove the 's' suffix and convert to float
-                consumed_airtime = float(consumed_airtime.rstrip('s'))
-                logger.debug(f"Parsed consumed_airtime: {consumed_airtime}s")
-            except ValueError as e:
-                logger.warning(
-                    f"Failed to parse consumed_airtime '{consumed_airtime}': {e}")
-                consumed_airtime = None
-
-        logger.debug(
-            f"Additional metadata - confirmed={confirmed}, f_cnt={f_cnt}, frequency={frequency}, consumed_airtime={consumed_airtime}")
-
-        # Send processed data to API with all metadata
-        send_data_to_api(
-            device_id=device_id,
-            temperature=temperature,
-            humidity=humidity,
-            air_pressure=pressure,
-            battery_voltage=battery_voltage,
-            confirmed=confirmed,
-            consumed_airtime=consumed_airtime,
-            f_cnt=f_cnt,
-            frequency=frequency,
-            rx_metadata=rx_metadata,
-            settings=settings
-        )
-
-        logger.info(
-            f"Message from device {device_id} successfully processed and saved.")
-        return 0
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        logger.debug(f"Full message payload: {payload}")
-        return 1
-
-
-def on_message(client, userdata, msg):
-    logger.info(f"Received MQTT message on topic: {msg.topic}")
-    logger.debug(f"Message QoS: {msg.qos}, Retain: {msg.retain}")
-
-    try:
-        raw_message = msg.payload.decode()
-        logger.debug(f"Raw message length: {len(raw_message)} characters")
-        logger.debug(f"Raw message: {raw_message}")
-
-        payload = json.loads(raw_message)
-        logger.info("Successfully parsed JSON message")
-
-        result = process_message(payload)
-        if result == 0:
-            logger.info("Message processing completed successfully")
-        else:
-            logger.warning("Message processing completed with errors")
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON message: {e}")
-        logger.debug(f"Invalid JSON content: {msg.payload.decode()}")
-    except Exception as e:
-        logger.error(f"Unexpected error in message handler: {e}")
-        logger.debug(f"Full error details: {type(e).__name__}: {str(e)}")
-
-
-def main():
-    logger.info("Starting ClimateGuard MQTT Client")
-    logger.info("="*50)
-
-    # Check for required environment variables
-    ttn_api_key = os.getenv("TTN_API_KEY")
-    QUANTUM_API_KEY = os.getenv("QUANTUM_API_KEY")
-
-    if not ttn_api_key:
-        logger.error("Error: TTN_API_KEY is not set!")
-        return
-
-    if not QUANTUM_API_KEY:
-        logger.error("Error: QUANTUM_API_KEY is not set!")
-        return
-
-    logger.info("All required API keys are configured")
-    logger.debug(f"TTN API key: {ttn_api_key[:8]}...")
-    logger.debug(f"QUAN API key: {QUANTUM_API_KEY[:8]}...")
-
-    # Initialize MQTT client
-    logger.info("Initializing MQTT client...")
-    mqtt_client = MQTTClient(
-        broker=MQTT_BROKER,
-        port=MQTT_PORT,
-        username=MQTT_USERNAME,
-        password=ttn_api_key,
-        topic=MQTT_TOPIC,
-        on_message_callback=on_message,
+        value = int(os.getenv(name, str(default)))
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if not 0 < value < 65536:
+        raise ValueError(f"{name} must be a valid TCP port")
+    return value
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def load_config() -> AppConfig:
+    """Read both source configurations without doing network or file writes."""
+    environment = os.getenv("ENV", "prod")
+    endpoint = os.getenv("QUANTUM_API_ENDPOINT")
+    if not endpoint:
+        endpoints_path = Path(__file__).parent.parent / "config" / "envs.json"
+        with endpoints_path.open(encoding="utf-8") as source:
+            endpoints = json.load(source).get(environment, [])
+        if len(endpoints) != 1:
+            raise ValueError(f"exactly one endpoint must be configured for ENV={environment!r}")
+        endpoint = endpoints[0]
+
+    return AppConfig(
+        sources=(
+            SourceConfig("ttn", os.getenv("MQTT_BROKER", "eu1.cloud.thethings.network"),
+                         _port("MQTT_PORT", 8883), os.getenv("MQTT_USERNAME", "climateguard@ttn"),
+                         _required("TTN_API_KEY"), os.getenv("MQTT_TOPIC", "v3/climateguard@ttn/devices/+/up")),
+            SourceConfig("mannheim", os.getenv("CLIMATEGUARD_TEST_MH_HOST", "hsma-iot.de"),
+                         _port("CLIMATEGUARD_TEST_MH_PORT", 8883),
+                         _required("CLIMATEGUARD_TEST_MH_USERNAME"), _required("CLIMATEGUARD_TEST_MH_PASSWORD"),
+                         os.getenv("CLIMATEGUARD_TEST_MH_TOPIC", "climateguard/#")),
+        ),
+        endpoint=endpoint,
+        quantum_api_key=os.getenv("QUANTUM_API_KEY"),
+        write_enabled=_truthy(os.getenv("QUANTUM_WRITE_ENABLED", "false")),
     )
 
-    # Connect and start listening
+
+def decode_payload(payload: str) -> tuple[float, float, float, float]:
+    """Decode the established TTN v1 binary payload layout."""
+    decoded = base64.b64decode(payload, validate=True)
+    layout_path = Path(__file__).parent.parent / "config" / "payload_layout.json"
+    with layout_path.open(encoding="utf-8") as source:
+        layout = json.load(source)
+    if not decoded:
+        raise ValueError("empty TTN frame payload")
+    if str(decoded[0]) != layout.get("version", "1"):
+        logger.warning("TTN payload version {} differs from configured version {}", decoded[0], layout.get("version"))
+
+    def extract(indices: list[int], signed: bool = False) -> float:
+        try:
+            return int.from_bytes(bytes(decoded[index] for index in indices), "big", signed=signed) / 100
+        except IndexError as error:
+            raise ValueError("TTN frame payload is shorter than configured layout") from error
+
+    return (extract(layout["temperature"], signed=True), extract(layout["humidity"]),
+            extract(layout["pressure"]), extract(layout["voltage"]))
+
+
+def _parse_utc_timestamp(value: Any) -> int:
+    if not isinstance(value, str):
+        raise ValueError("Mannheim payload requires a UTC string field 'time'")
     try:
-        mqtt_client.connect()
-        logger.info("MQTT client connected successfully")
-        logger.info("Starting message processing loop...")
-        mqtt_client.loop_forever()
-    except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt, shutting down gracefully...")
-    except Exception as e:
-        logger.error(f"Fatal error in main loop: {e}")
-        logger.debug(f"Full error details: {type(e).__name__}: {str(e)}")
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("Mannheim payload field 'time' is not ISO-8601") from error
+    if timestamp.tzinfo is None:
+        raise ValueError("Mannheim payload field 'time' must include UTC offset")
+    return int(timestamp.timestamp())
+
+
+def normalize_mannheim(payload: Mapping[str, Any], topic: str) -> Metric:
+    """Normalize exactly the two known Mannheim station topics."""
+    try:
+        device_name = MANNHEIM_TOPIC_DEVICES[topic]
+    except KeyError as error:
+        raise ValueError(f"unrecognized Mannheim topic: {topic}") from error
+    try:
+        temperature, humidity = float(payload["Temperature0"]), float(payload["Humidity0"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Mannheim payload requires numeric Temperature0 and Humidity0") from error
+    return Metric(device_name=device_name, timestamp_device=_parse_utc_timestamp(payload.get("time")),
+                  temperature=temperature, humidity=humidity)
+
+
+def normalize_ttn(payload: Mapping[str, Any]) -> Metric:
+    uplink = payload.get("uplink_message")
+    device_ids = payload.get("end_device_ids")
+    if not isinstance(uplink, Mapping) or not isinstance(device_ids, Mapping):
+        raise ValueError("TTN message is missing uplink_message or end_device_ids")
+    frame = uplink.get("frm_payload")
+    device_name = device_ids.get("device_id")
+    if not isinstance(frame, str) or not frame or not isinstance(device_name, str) or not device_name:
+        raise ValueError("TTN message requires frm_payload and device_id")
+    temperature, humidity, pressure, battery_voltage = decode_payload(frame)
+    extra: dict[str, Any] = {}
+    for name in ("confirmed", "f_cnt"):
+        if name in uplink:
+            extra[name] = uplink[name]
+    settings = uplink.get("settings")
+    if isinstance(settings, Mapping) and "frequency" in settings:
+        extra["frequency"] = settings["frequency"]
+    return Metric(device_name=device_name, timestamp_device=int(datetime.now(timezone.utc).timestamp()),
+                  temperature=temperature, humidity=humidity, air_pressure=pressure,
+                  battery_voltage=battery_voltage, extra=extra)
+
+
+class QuantumDelivery:
+    """The only outbound path. Disabled unless explicitly opted in."""
+    def __init__(self, config: AppConfig, post: Callable[..., Any] = requests.post):
+        self.config = config
+        self._post = post
+
+    def deliver(self, metric: Metric) -> bool:
+        if not self.config.write_enabled:
+            logger.info("Quantum delivery disabled; metric: {}", metric.as_api_payload())
+            return False
+        if not self.config.quantum_api_key:
+            raise ValueError("QUANTUM_API_KEY must be set when QUANTUM_WRITE_ENABLED=true")
+        response = self._post(self.config.endpoint, json=metric.as_api_payload(), headers={
+            "Content-Type": "application/json", "X-API-Key": self.config.quantum_api_key}, timeout=10)
+        response.raise_for_status()
+        return True
+
+
+class MQTTSourceClient:
+    def __init__(self, source: SourceConfig, handle: Callable[[str, bytes], None], client: Any = None):
+        self.source, self.handle = source, handle
+        self.client = client or mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self.client.username_pw_set(source.username, source.password)
+        self.client.tls_set()
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+
+    def _on_connect(self, client: Any, _userdata: Any, _flags: Any, reason_code: Any, _properties: Any) -> None:
+        failed = getattr(reason_code, "is_failure", None)
+        if failed is None:
+            failed = int(reason_code) >= 128
+        if failed:
+            logger.error("{} broker rejected connection: {}", self.source.name, reason_code)
+            return
+        result, _mid = client.subscribe(self.source.topic)
+        if result != mqtt.MQTT_ERR_SUCCESS:
+            logger.error("{} subscription failed: {}", self.source.name, result)
+
+    def _on_message(self, _client: Any, _userdata: Any, message: Any) -> None:
+        self.handle(message.topic, message.payload)
+
+    def start(self) -> None:
+        self.client.connect(self.source.broker, self.source.port, keepalive=60)
+        self.client.loop_start()
+
+    def stop(self) -> None:
+        self.client.loop_stop()
+        self.client.disconnect()
+
+
+def start_clients(clients: list[MQTTSourceClient]) -> list[MQTTSourceClient]:
+    """Start every source independently so one unavailable broker is isolated."""
+    started: list[MQTTSourceClient] = []
+    for client in clients:
+        try:
+            client.start()
+        except Exception as error:
+            logger.error("Failed to start {} MQTT source: {}", client.source.name, error)
+        else:
+            started.append(client)
+    return started
+
+
+def build_message_handler(source_name: str, delivery: QuantumDelivery) -> Callable[[str, bytes], None]:
+    normalizer = normalize_ttn if source_name == "ttn" else normalize_mannheim
+
+    def handle(topic: str, raw_payload: bytes) -> None:
+        try:
+            parsed = json.loads(raw_payload.decode("utf-8"))
+            metric = normalizer(parsed) if source_name == "ttn" else normalizer(parsed, topic)
+            delivery.deliver(metric)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            logger.error("Discarded invalid {} message on {}: {}", source_name, topic, error)
+        except requests.RequestException as error:
+            logger.error("Quantum delivery failed for {}: {}", source_name, error)
+    return handle
+
+
+def main() -> None:
+    load_dotenv()
+    try:
+        config = load_config()
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        logger.error("Configuration error: {}", error)
+        return
+    if config.write_enabled:
+        logger.warning("Quantum writes are enabled: each received metric causes one POST")
+    else:
+        logger.warning("Quantum writes are disabled (QUANTUM_WRITE_ENABLED is not true)")
+    delivery = QuantumDelivery(config)
+    clients = [MQTTSourceClient(source, build_message_handler(source.name, delivery)) for source in config.sources]
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_args: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_args: stop.set())
+    try:
+        clients = start_clients(clients)
+        if not clients:
+            logger.error("No MQTT sources could be started")
+            return
+        stop.wait()
     finally:
-        logger.info("ClimateGuard MQTT Client shutting down")
-        logger.info("="*50)
+        for client in clients:
+            try:
+                client.stop()
+            except Exception as error:
+                logger.warning("Failed to stop {} MQTT source: {}", client.source.name, error)
 
 
 if __name__ == "__main__":

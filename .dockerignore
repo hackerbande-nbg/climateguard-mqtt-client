@@ -1,0 +1,11 @@
+# Never include local credentials or captured telemetry in image build contexts.
+.env
+.env.*
+!.env.example
+data/
+*.log
+__pycache__/
+*.py[cod]
+.git/
+.pytest_cache/
+coverage/
