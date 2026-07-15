@@ -74,6 +74,15 @@ def test_load_config_reads_both_source_sets(monkeypatch):
     assert config.write_enabled is False
 
 
+def test_load_config_accepts_uppercase_environment_names(monkeypatch):
+    monkeypatch.setenv("ENV", "PROD")
+    monkeypatch.setenv("TTN_API_KEY", "ttn")
+    monkeypatch.setenv("CLIMATEGUARD_TEST_MH_USERNAME", "mh")
+    monkeypatch.setenv("CLIMATEGUARD_TEST_MH_PASSWORD", "secret")
+
+    assert load_config().endpoint == "https://api.quantum.hackerban.de/v2/metrics"
+
+
 def test_compose_passes_both_sources_and_keeps_writes_disabled_by_default():
     compose = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text()
     assert "CLIMATEGUARD_TEST_MH_USERNAME" in compose

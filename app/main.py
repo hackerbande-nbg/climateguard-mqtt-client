@@ -93,7 +93,7 @@ def _truthy(value: str) -> bool:
 
 def load_config() -> AppConfig:
     """Read both source configurations without doing network or file writes."""
-    environment = os.getenv("ENV", "prod")
+    environment = os.getenv("ENV", "prod").strip().casefold()
     endpoint = os.getenv("QUANTUM_API_ENDPOINT")
     if not endpoint:
         endpoints_path = Path(__file__).parent.parent / "config" / "envs.json"
